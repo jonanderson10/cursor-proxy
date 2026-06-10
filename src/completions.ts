@@ -3,7 +3,7 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import type { ChatCompletionRequest } from "./types.js";
 import { preparePrompt } from "./prompt.js";
 import { runAgent, runAgentStream } from "./cursor-agent.js";
-import { chatCompletionResponse, streamChunks } from "./translate.js";
+import { chatCompletionResponse, streamChunks, toSdkCustomTools } from "./translate.js";
 import { recordModel } from "./models.js";
 
 /**
@@ -25,12 +25,20 @@ export async function handleCompletions(
     throw error;
   }
 
-  // Validate
+  // Validate required fields
   if (!request.model) {
     return jsonError(res, 400, "Missing required field: model");
   }
   if (!request.messages || request.messages.length === 0) {
     return jsonError(res, 400, "Missing required field: messages");
+  }
+
+  // #7 Request validation — reject unsupported parameters
+  if (typeof request.n === "number" && request.n !== 1) {
+    return jsonError(res, 400, "Only n=1 is supported");
+  }
+  if (request.logprobs || request.top_logprobs !== undefined) {
+    return jsonError(res, 400, "logprobs are not available");
   }
 
   // Track unknown models for /v1/models discovery
@@ -39,13 +47,15 @@ export async function handleCompletions(
   const requestId = `chatcmpl-${randomUUID().replace(/-/g, "").slice(0, 24)}`;
   const model = request.model;
   const tools = request.tools ?? [];
-  const { text: prompt } = preparePrompt(request.messages, tools);
+  const { text: prompt } = preparePrompt(request.messages, tools, request.tool_choice);
+  const customTools = tools.length > 0 ? toSdkCustomTools(tools) : undefined;
+  const requiresLocalTool = tools.length > 0;
 
   if (request.stream) {
-    return handleStreaming(res, requestId, model, apiKey, prompt, tools, request.reasoningEffort);
+    return handleStreaming(res, requestId, model, apiKey, prompt, tools, customTools, request.reasoningEffort, requiresLocalTool);
   }
 
-  return handleNonStreaming(res, requestId, model, apiKey, prompt, request.reasoningEffort);
+  return handleNonStreaming(res, requestId, model, apiKey, prompt, tools, customTools, request.reasoningEffort, requiresLocalTool);
 }
 
 async function handleNonStreaming(
@@ -54,7 +64,10 @@ async function handleNonStreaming(
   model: string,
   apiKey: string,
   prompt: string,
-  reasoningEffort?: string
+  tools: { type: "function"; function: { name: string } }[],
+  customTools?: Record<string, import("@cursor/sdk").SDKCustomTool>,
+  reasoningEffort?: string,
+  requiresLocalTool?: boolean
 ): Promise<void> {
   try {
     const result = await runAgent({
@@ -62,6 +75,8 @@ async function handleNonStreaming(
       model,
       prompt,
       reasoningEffort,
+      customTools,
+      requiresLocalTool,
     });
 
     const response = chatCompletionResponse({
@@ -71,6 +86,7 @@ async function handleNonStreaming(
       toolCalls: result.toolCalls,
       finishReason: result.toolCalls.length > 0 ? "tool_calls" : "stop",
       promptText: prompt,
+      tools,
     });
 
     res.writeHead(200, {
@@ -85,6 +101,9 @@ async function handleNonStreaming(
   }
 }
 
+/**
+ * #6 True streaming — yields SSE chunks incrementally as events arrive.
+ */
 async function handleStreaming(
   res: ServerResponse,
   requestId: string,
@@ -92,7 +111,9 @@ async function handleStreaming(
   apiKey: string,
   prompt: string,
   tools: { type: "function"; function: { name: string } }[],
-  reasoningEffort?: string
+  customTools?: Record<string, import("@cursor/sdk").SDKCustomTool>,
+  reasoningEffort?: string,
+  requiresLocalTool?: boolean
 ): Promise<void> {
   res.writeHead(200, {
     "Content-Type": "text/event-stream",
@@ -102,38 +123,102 @@ async function handleStreaming(
   });
 
   try {
-    // Collect tool calls or stream text
     const toolCalls: { name: string; arguments: Record<string, unknown> }[] = [];
-    const textChunks: string[] = [];
+    let streamedText = "";
 
-    for await (const event of runAgentStream({ apiKey, model, prompt, reasoningEffort })) {
+    // Yield SSE chunks incrementally as events arrive
+    for await (const event of runAgentStream({ apiKey, model, prompt, reasoningEffort, customTools, requiresLocalTool })) {
       if (event.type === "tool_call" && event.toolCall) {
         toolCalls.push(event.toolCall);
       } else if (event.type === "text" && event.text) {
-        textChunks.push(event.text);
+        streamedText += event.text;
+        // Emit text chunk immediately
+        writeSSE(res, {
+          id: requestId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { content: event.text }, logprobs: null, finish_reason: null }],
+          service_tier: "default",
+          system_fingerprint: null,
+        });
+      } else if (event.type === "thinking" && event.text) {
+        // Emit thinking chunk immediately
+        writeSSE(res, {
+          id: requestId,
+          object: "chat.completion.chunk",
+          created: Math.floor(Date.now() / 1000),
+          model,
+          choices: [{ index: 0, delta: { reasoning_content: event.text }, logprobs: null, finish_reason: null }],
+          service_tier: "default",
+          system_fingerprint: null,
+        });
       }
     }
 
-    // Now emit SSE chunks
-    const textStream = async function* () {
-      for (const chunk of textChunks) yield chunk;
-    };
-
-    for await (const chunk of streamChunks({
-      id: requestId,
-      model,
-      textStream: textStream(),
-      toolCalls,
-      promptText: prompt,
-    })) {
-      writeSSE(res, chunk);
+    // Emit role chunk at start (retroactive for clients that need it)
+    // Note: Some clients expect the role chunk first. We emit it here as a
+    // single combined chunk with tool_calls if present.
+    if (toolCalls.length > 0) {
+      // Emit tool calls as final chunk
+      const { toOpenAiToolCalls } = await import("./translate.js");
+      const openAiToolCalls = toOpenAiToolCalls(toolCalls, tools);
+      writeSSE(res, {
+        id: requestId,
+        object: "chat.completion.chunk",
+        created: Math.floor(Date.now() / 1000),
+        model,
+        choices: [{
+          index: 0,
+          delta: {
+            tool_calls: openAiToolCalls.map((tc, i) => ({
+              index: i,
+              id: tc.id,
+              type: "function" as const,
+              function: { name: tc.function.name, arguments: tc.function.arguments },
+            })),
+          },
+          logprobs: null,
+          finish_reason: null,
+        }],
+        service_tier: "default",
+        system_fingerprint: null,
+      });
     }
+
+    // Finish chunk
+    writeSSE(res, {
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [{ index: 0, delta: {}, logprobs: null, finish_reason: toolCalls.length > 0 ? "tool_calls" : "stop" }],
+      service_tier: "default",
+      system_fingerprint: null,
+    });
+
+    // Usage chunk
+    writeSSE(res, {
+      id: requestId,
+      object: "chat.completion.chunk",
+      created: Math.floor(Date.now() / 1000),
+      model,
+      choices: [],
+      usage: {
+        prompt_tokens: Math.ceil((prompt?.length ?? 0) / 4) + 500,
+        completion_tokens: Math.ceil(streamedText.length / 4),
+        total_tokens: Math.ceil((prompt?.length ?? 0) / 4) + 500 + Math.ceil(streamedText.length / 4),
+        prompt_tokens_details: { cached_tokens: 0, audio_tokens: 0 },
+        completion_tokens_details: { reasoning_tokens: 0, audio_tokens: 0 },
+      },
+      service_tier: "default",
+      system_fingerprint: null,
+    });
 
     res.write("data: [DONE]\n\n");
     res.end();
   } catch (error) {
     console.error("Cursor SDK streaming error:", error);
-    // Emit error as SSE event
     const errorChunk = {
       error: {
         message: error instanceof Error ? error.message : "Streaming error",

@@ -12,6 +12,8 @@ export interface ChatCompletionRequest {
   stop?: string | string[];
   response_format?: { type: "text" | "json_object" | "json_schema"; [key: string]: unknown };
   n?: number;
+  logprobs?: boolean;
+  top_logprobs?: number;
   reasoningEffort?: string;
 }
 
@@ -97,6 +99,7 @@ export interface ChatCompletionChunkChoice {
   delta: {
     role?: "assistant";
     content?: string;
+    reasoning_content?: string;
     tool_calls?: ToolCallDelta[];
   };
   logprobs: null;

@@ -30,8 +30,8 @@ describe("preparePrompt", () => {
         { type: "function", function: { name: "bash" } },
       ];
       const result = preparePrompt([{ role: "user", content: "hi" }], tools);
-      expect(result.text).toContain("You are an agent");
-      expect(result.text).toContain("Do not say you cannot run tools");
+      expect(result.text).toContain("SDK-compatible OpenCode harness");
+      expect(result.text).toContain("OpenCode owns local tool execution");
     });
   });
 
@@ -171,20 +171,15 @@ describe("preparePrompt", () => {
       expect(result.text).toContain('"description":"Run a shell command"');
     });
 
-    it("uses empty string for missing description", () => {
+    it("omits description and parameters when not provided", () => {
       const tools: ToolDefinition[] = [
         { type: "function", function: { name: "test" } },
       ];
       const result = preparePrompt([{ role: "user", content: "hi" }], tools);
-      expect(result.text).toContain('"description":""');
-    });
-
-    it("uses empty object for missing parameters", () => {
-      const tools: ToolDefinition[] = [
-        { type: "function", function: { name: "test" } },
-      ];
-      const result = preparePrompt([{ role: "user", content: "hi" }], tools);
-      expect(result.text).toContain('"parameters":{}');
+      // New format: only includes fields that are truthy
+      expect(result.text).toContain('"name":"test"');
+      expect(result.text).not.toContain('"description"');
+      expect(result.text).not.toContain('"parameters"');
     });
 
     it("does not append tool inventory when no tools", () => {
@@ -193,18 +188,20 @@ describe("preparePrompt", () => {
     });
   });
 
-  describe("agent mode primer", () => {
-    it("appends primer when tools present", () => {
+  describe("SDK routing map", () => {
+    it("includes routing map when tools present", () => {
       const tools: ToolDefinition[] = [
         { type: "function", function: { name: "bash" } },
       ];
       const result = preparePrompt([{ role: "user", content: "hi" }], tools);
-      expect(result.text).toContain("respond with exactly one tool call");
+      expect(result.text).toContain("SDK TOOL ROUTING MAP");
+      expect(result.text).toContain('"sdk":"shell"');
+      expect(result.text).toContain('"client":"bash"');
     });
 
-    it("does not append primer when no tools", () => {
+    it("does not include routing map when no tools", () => {
       const result = preparePrompt([{ role: "user", content: "hi" }]);
-      expect(result.text).not.toContain("respond with exactly one tool call");
+      expect(result.text).not.toContain("SDK TOOL ROUTING MAP");
     });
   });
 
@@ -213,6 +210,91 @@ describe("preparePrompt", () => {
       const result = preparePrompt([]);
       expect(result.mode).toBe("ask");
       expect(result.text).toContain("helpful coding assistant");
+    });
+  });
+
+  // --- G4: tool_choice directive ---
+
+  describe("tool_choice hints", () => {
+    const tools: ToolDefinition[] = [
+      { type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } },
+    ];
+
+    it("emits required hint for tool_choice: required", () => {
+      const result = preparePrompt([{ role: "user", content: "hi" }], tools, "required");
+      expect(result.text).toContain("You must call at least one tool");
+    });
+
+    it("emits named tool hint for tool_choice with function name", () => {
+      const result = preparePrompt(
+        [{ role: "user", content: "hi" }], tools,
+        { type: "function", function: { name: "bash" } }
+      );
+      expect(result.text).toContain("Use the `bash` tool");
+    });
+
+    it("does not emit hints for tool_choice: auto", () => {
+      const result = preparePrompt([{ role: "user", content: "hi" }], tools, "auto");
+      expect(result.text).not.toContain("You must call at least one tool");
+      expect(result.text).not.toContain("Use the `bash` tool");
+    });
+
+    it("does not emit hints when no tool_choice", () => {
+      const result = preparePrompt([{ role: "user", content: "hi" }], tools);
+      expect(result.text).not.toContain("You must call at least one tool");
+      expect(result.text).not.toContain("Use the `bash` tool");
+    });
+  });
+
+  // --- G5-G7: Minor result fields ---
+
+  describe("tool result formatting", () => {
+    const tools: ToolDefinition[] = [
+      { type: "function", function: { name: "bash", parameters: { type: "object", properties: { command: { type: "string" } } } } },
+      { type: "function", function: { name: "write", parameters: { type: "object", properties: { path: { type: "string" }, content: { type: "string" } } } } },
+    ];
+
+    it("shell result includes signal and executionTime fields", () => {
+      const messages: ChatMessage[] = [
+        { role: "user", content: "run ls" },
+        {
+          role: "assistant", content: null,
+          tool_calls: [{ id: "call_1", type: "function", function: { name: "bash", arguments: '{"command":"ls"}' } }],
+        },
+        { role: "tool", tool_call_id: "call_1", name: "bash", content: '{"exitCode":0,"stdout":"file.txt\n","stderr":""}' },
+      ];
+      const result = preparePrompt(messages, tools);
+      // The SDK TOOL RESULT should contain signal and executionTime
+      expect(result.text).toContain("SDK TOOL RESULT");
+      expect(result.text).toContain('"signal"');
+      expect(result.text).toContain('"executionTime"');
+    });
+
+    it("write result includes fileSize field", () => {
+      const messages: ChatMessage[] = [
+        { role: "user", content: "write file" },
+        {
+          role: "assistant", content: null,
+          tool_calls: [{ id: "call_2", type: "function", function: { name: "write", arguments: '{"path":"f.txt","content":"hello world"}' } }],
+        },
+        { role: "tool", tool_call_id: "call_2", name: "write", content: '{"ok":true}' },
+      ];
+      const result = preparePrompt(messages, tools);
+      expect(result.text).toContain("SDK TOOL RESULT");
+      expect(result.text).toContain('"fileSize"');
+    });
+
+    it("error result is detected", () => {
+      const messages: ChatMessage[] = [
+        { role: "user", content: "run bad cmd" },
+        {
+          role: "assistant", content: null,
+          tool_calls: [{ id: "call_3", type: "function", function: { name: "bash", arguments: '{"command":"bad"}' } }],
+        },
+        { role: "tool", tool_call_id: "call_3", name: "bash", content: '{"exitCode":1,"stdout":"","stderr":"command not found"}' },
+      ];
+      const result = preparePrompt(messages, tools);
+      expect(result.text).toContain('"status":"error"');
     });
   });
 });

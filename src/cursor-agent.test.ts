@@ -1,6 +1,13 @@
 import { describe, it, expect } from "vitest";
 import { normalizeModel, parseModelVariant, resolveVariantParams, mapReasoningEffort } from "./cursor-agent.js";
 
+// We need to test the internal validation functions. Since they're not exported,
+// we test them indirectly through the module's behavior. But we can test
+// the exported normalizeToolCall behavior via the module's public API.
+
+// For G1/G3, we test the normalizeModel function (already tested) and add
+// tests for the new exported functions.
+
 describe("parseModelVariant", () => {
   it("returns null variant for plain model", () => {
     expect(parseModelVariant("gpt-5.5")).toEqual({ base: "gpt-5.5", variant: null });
@@ -177,5 +184,229 @@ describe("normalizeModel", () => {
     it("trims tabs and spaces", () => {
       expect(normalizeModel("\tcomposer-2.5\t")).toBe("composer-2.5");
     });
+  });
+});
+
+// --- G1: Tool call validation gate ---
+
+import { isEmittableToolCall, normalizeToolCall } from "./cursor-agent.js";
+import type { CursorToolCall } from "./types.js";
+
+describe("isEmittableToolCall", () => {
+  it("rejects shell without command", () => {
+    expect(isEmittableToolCall({ name: "shell", arguments: {} })).toBe(false);
+  });
+
+  it("accepts shell with command", () => {
+    expect(isEmittableToolCall({ name: "shell", arguments: { command: "ls" } })).toBe(true);
+  });
+
+  it("rejects write without path", () => {
+    expect(isEmittableToolCall({ name: "write", arguments: { content: "hello" } })).toBe(false);
+  });
+
+  it("rejects write without content", () => {
+    expect(isEmittableToolCall({ name: "write", arguments: { path: "f.txt" } })).toBe(false);
+  });
+
+  it("accepts write with path and content", () => {
+    expect(isEmittableToolCall({ name: "write", arguments: { path: "f.txt", content: "hi" } })).toBe(true);
+  });
+
+  it("accepts write with streamContent", () => {
+    expect(isEmittableToolCall({ name: "write", arguments: { path: "f.txt", streamContent: "hi" } })).toBe(true);
+  });
+
+  it("rejects edit without path", () => {
+    expect(isEmittableToolCall({ name: "edit", arguments: { oldString: "a", newString: "b" } })).toBe(false);
+  });
+
+  it("rejects edit without replacement fields", () => {
+    expect(isEmittableToolCall({ name: "edit", arguments: { path: "f.txt" } })).toBe(false);
+  });
+
+  it("accepts edit with old/new strings", () => {
+    expect(isEmittableToolCall({ name: "edit", arguments: { path: "f.txt", oldString: "a", newString: "b" } })).toBe(true);
+  });
+
+  it("accepts edit with patchContent", () => {
+    expect(isEmittableToolCall({ name: "edit", arguments: { path: "f.txt", patchContent: "@@ -1 +1 @@" } })).toBe(true);
+  });
+
+  it("accepts edit with streamContent", () => {
+    expect(isEmittableToolCall({ name: "edit", arguments: { path: "f.txt", streamContent: "new content" } })).toBe(true);
+  });
+
+  it("rejects read without path", () => {
+    expect(isEmittableToolCall({ name: "read", arguments: {} })).toBe(false);
+  });
+
+  it("accepts read with path", () => {
+    expect(isEmittableToolCall({ name: "read", arguments: { path: "f.txt" } })).toBe(true);
+  });
+
+  it("rejects grep without pattern", () => {
+    expect(isEmittableToolCall({ name: "grep", arguments: { path: "." } })).toBe(false);
+  });
+
+  it("accepts grep with pattern", () => {
+    expect(isEmittableToolCall({ name: "grep", arguments: { pattern: "TODO" } })).toBe(true);
+  });
+
+  it("accepts glob with pattern", () => {
+    expect(isEmittableToolCall({ name: "glob", arguments: { globPattern: "**/*.ts" } })).toBe(true);
+  });
+
+  it("accepts glob with wildcard in path", () => {
+    expect(isEmittableToolCall({ name: "glob", arguments: { path: "src/*.ts" } })).toBe(true);
+  });
+
+  it("rejects glob without any pattern", () => {
+    expect(isEmittableToolCall({ name: "glob", arguments: { path: "src" } })).toBe(false);
+  });
+
+  it("accepts ls unconditionally", () => {
+    expect(isEmittableToolCall({ name: "ls", arguments: {} })).toBe(true);
+  });
+
+  it("accepts mcp with toolName", () => {
+    expect(isEmittableToolCall({ name: "mcp", arguments: { toolName: "filesystem__read" } })).toBe(true);
+  });
+
+  it("rejects mcp without toolName", () => {
+    expect(isEmittableToolCall({ name: "mcp", arguments: {} })).toBe(false);
+  });
+
+  it("rejects unknown tool with empty args", () => {
+    expect(isEmittableToolCall({ name: "customtool", arguments: {} })).toBe(false);
+  });
+
+  it("accepts unknown tool with args", () => {
+    expect(isEmittableToolCall({ name: "customtool", arguments: { foo: "bar" } })).toBe(true);
+  });
+
+  it("accepts reconstructed mcp__provider__toolName with args", () => {
+    expect(isEmittableToolCall({ name: "mcp__filesystem__read", arguments: { path: "f.txt" } })).toBe(true);
+  });
+});
+
+// --- G3: streamContent normalization in normalizeToolCall ---
+
+describe("normalizeToolCall", () => {
+  it("returns null for empty name", () => {
+    expect(normalizeToolCall({ args: {} })).toBeNull();
+  });
+
+  it("normalizes edit with streamContent to write", () => {
+    const tc = normalizeToolCall({
+      name: "edit",
+      args: { path: "src/index.ts", streamContent: "new content" },
+    });
+    expect(tc).toEqual({
+      name: "write",
+      arguments: { path: "src/index.ts", fileText: "new content" },
+    });
+  });
+
+  it("does not convert edit without streamContent", () => {
+    const tc = normalizeToolCall({
+      name: "edit",
+      args: { path: "f.txt", oldString: "a", newString: "b" },
+    });
+    expect(tc?.name).toBe("edit");
+  });
+
+  it("does not convert non-edit tools", () => {
+    const tc = normalizeToolCall({ name: "read", args: { path: "f.txt" } });
+    expect(tc?.name).toBe("read");
+  });
+
+  it("uses type as name fallback", () => {
+    const tc = normalizeToolCall({ type: "shell", args: { command: "ls" } });
+    expect(tc?.name).toBe("shell");
+  });
+
+  it("uses name when type absent", () => {
+    const tc = normalizeToolCall({ name: "read", args: { path: "f.txt" } });
+    expect(tc?.name).toBe("read");
+  });
+
+  it("handles null args", () => {
+    const tc = normalizeToolCall({ name: "shell", args: null });
+    expect(tc?.arguments).toEqual({});
+  });
+
+  it("handles non-object args", () => {
+    const tc = normalizeToolCall({ name: "shell", args: "invalid" });
+    expect(tc?.arguments).toEqual({});
+  });
+
+  // MCP reconstruction tests
+  it("reconstructs mcp tool call from providerIdentifier and toolName", () => {
+    const tc = normalizeToolCall({
+      name: "mcp",
+      args: { providerIdentifier: "client", toolName: "read", args: { path: "src/index.ts" } },
+    });
+    expect(tc?.name).toBe("mcp__client__read");
+    expect(tc?.arguments).toEqual({ path: "src/index.ts" });
+  });
+
+  it("reconstructs callmcptool to mcp__provider__toolName", () => {
+    const tc = normalizeToolCall({
+      name: "callmcptool",
+      args: { providerIdentifier: "client", toolName: "create_issue", args: { title: "Bug" } },
+    });
+    expect(tc?.name).toBe("mcp__client__create_issue");
+    expect(tc?.arguments).toEqual({ title: "Bug" });
+  });
+
+  it("uses alternative arg keys for provider and toolName", () => {
+    const tc = normalizeToolCall({
+      name: "mcp",
+      args: { provider: "client", name: "write", args: { path: "f.txt", content: "hi" } },
+    });
+    expect(tc?.name).toBe("mcp__client__write");
+    expect(tc?.arguments).toEqual({ path: "f.txt", content: "hi" });
+  });
+
+  it("falls back to full args when nested args missing", () => {
+    const tc = normalizeToolCall({
+      name: "mcp",
+      args: { providerIdentifier: "client", toolName: "read", path: "f.txt" },
+    });
+    expect(tc?.name).toBe("mcp__client__read");
+    expect(tc?.arguments).toEqual({ providerIdentifier: "client", toolName: "read", path: "f.txt" });
+  });
+
+  it("does not reconstruct mcp when providerIdentifier missing", () => {
+    const tc = normalizeToolCall({
+      name: "mcp",
+      args: { toolName: "read", args: { path: "f.txt" } },
+    });
+    expect(tc?.name).toBe("mcp");
+  });
+
+  it("does not reconstruct mcp when toolName missing", () => {
+    const tc = normalizeToolCall({
+      name: "mcp",
+      args: { providerIdentifier: "client", args: { path: "f.txt" } },
+    });
+    expect(tc?.name).toBe("mcp");
+  });
+
+  it("suppresses mcp call with unknown provider", () => {
+    const tc = normalizeToolCall({
+      name: "mcp",
+      args: { providerIdentifier: "custom-user-tools", toolName: "read", args: { path: "f.txt" } },
+    });
+    expect(tc).toBeNull();
+  });
+
+  it("suppresses callmcptool with unknown provider", () => {
+    const tc = normalizeToolCall({
+      name: "callmcptool",
+      args: { providerIdentifier: "filesystem", toolName: "read", args: { path: "f.txt" } },
+    });
+    expect(tc).toBeNull();
   });
 });
